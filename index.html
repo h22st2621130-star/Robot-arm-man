@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="로봇팔 시뮬레이터">
+<title>2관절 로봇팔 시뮬레이터 v3 (실물 반영)</title>
+<style>
+body{font-family:-apple-system,sans-serif;margin:10px;background:#fafafa}
+.row{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:end}
+label{font-size:13px;display:flex;flex-direction:column}
+select,input{font-size:16px;padding:4px}
+button{font-size:15px;padding:8px 12px;margin:6px 6px 6px 0}
+canvas{width:100%;display:block;border-radius:8px;touch-action:none}
+#arm{height:420px}
+#scope{height:380px;margin-top:8px}
+#msg{margin:6px 0;font-size:15px;font-weight:bold}
+table{border-collapse:collapse;margin-top:10px}
+td,th{border:1px solid #888;padding:4px 8px;font-size:13px}
+textarea{width:100%;height:120px}
+</style></head><body>
+<h2>2관절 로봇팔 시뮬레이터 v3</h2>
+<div class="row">
+ <label>환경<select id="env"><option value="air">지상</option><option value="water">수중(중성부력)</option><option value="space">우주(이상적)</option></select></label>
+ <label>링크비<select id="ratio"><option>1:1</option><option>2:1</option><option>1:2</option></select></label>
+ <label>말단 부하(g)<select id="load"><option>0</option><option>25</option></select></label>
+ <label>장갑(손) 질량(g)<input id="hand" type="number" value="0" min="0" step="5" style="width:70px"></label>
+ <label>링크 선밀도(g/m)<input id="lin" type="number" value="200" step="10" style="width:70px"></label>
+ <label>서보 질량(g)<input id="ms" type="number" value="50" step="5" style="width:70px"></label>
+ <label>서보 최대토크(N·m)<input id="tm" type="number" value="0.10" step="0.01" style="width:70px"></label>
+ <label>중성부력 보정률<input id="neutral" type="number" value="1" min="0" max="1" step="0.1" style="width:70px"></label>
+ <label>재생속도<select id="speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option></select></label>
+ <label>시간축(s/div)<select id="tdiv"><option>0.5</option><option selected>1</option><option>2</option><option>5</option></select></label>
+ <label>확대<input id="zoom" type="range" min="0.6" max="1.6" step="0.05" value="1"></label>
+</div>
+<button onclick="runOne()">▶ 실행</button>
+<button onclick="toggleRun()">RUN / STOP</button>
+<button onclick="runAll()">전체 조건 × 3회</button>
+<button onclick="setCam(0,0.12)">정면</button>
+<button onclick="setCam(-0.7,0.45)">사선</button>
+<button onclick="setCam(1.57,0.12)">측면</button>
+<button onclick="setCam(0,1.4)">위</button>
+<div id="msg">조건을 고르고 실행을 누르세요. 위 화면은 드래그로 회전합니다.</div>
+<canvas id="arm"></canvas>
+<canvas id="scope"></canvas>
+<table id="out"></table>
+<h3>CSV (엑셀에 붙여넣기)</h3>
+<textarea id="csv"></textarea>
+
+<script>
+const $=id=>document.getElementById(id);
+// ===== 임시 파라미터 (실측값으로 교체!) =====
+const P={Lt:0.36,lin:0.2,ms:0.05,d:0.05,tm:0.10,wmax:2.0,Kp:3,Kv:0.05,
+  V:6,kt:0.1,I0:0.1,Rs:2.2,Rint:0.5,rho:1000,Ca:1.0,Cd:1.0};
+// 실물 치수(m) - 사진 기반 추정값, 줄자로 실측해서 교체
+const GEO={plate:0.15,pt:0.012,tw0:0.08,tw1:0.03,th:0.25,ZL:0.31,off:0.045};
+const g=9.81,dt=0.001;
+const NAME={air:'지상',water:'수중',space:'우주'};
+const clamp=(x,a)=>Math.max(-a,Math.min(a,x));
+const randn=()=>(Math.random()+Math.random()+Math.random()-1.5)*2;
+function applyParams(){P.lin=+$('lin').value/1000;P.ms=+$('ms').value/1000;P.tm=+$('tm').value;}
+
+// ===== 물리 시뮬레이션 =====
+function sim(env,ratio,loadg,neutral,handg,rec){
+  const [a,b]=ratio.split(':').map(Number);
+  const R=P.Lt*a/(a+b), L=P.Lt*b/(a+b);
+  const m1=P.lin*R,m2=P.lin*L,mL=loadg/1000,mh=handg/1000,ms=P.ms,rh=L+0.08;
+  const water=env==='water';
+  let I1=m1*R*R/3+ms*R*R+m2*(R*R+L*L/6)+mL*(R*R+L*L/2)+mh*(R*R+rh*rh/2);
+  let I2=m2*L*L/3+mL*L*L+mh*rh*rh;
+  const gf=env==='space'?0:(water?1-neutral:1);
+  const G=(m2*L/2+mL*L+mh*rh)*g*gf;
+  if(Math.abs(G)>P.tm*0.98)
+    return {fail:true,reason:`구동 불가: 2번 관절 중력 토크 ${G.toFixed(3)} N·m > 서보 최대 토크 ${P.tm} N·m`,R,L};
+  let d1=0,d2=0;
+  if(water){
+    const A_=Math.PI/4*P.d*P.d,k=P.Ca*P.rho*A_;
+    I1+=k*(R**3/3+R*R*L+L**3/6); I2+=k*L**3/3;      // 부가질량
+    d1=0.5*P.rho*P.Cd*P.d*(P.Lt**4/4);              // 항력 토크 계수
+    d2=0.5*P.rho*P.Cd*P.d*(L**4/4);
+  }
+  const I=[I1,I2],D=[d1,d2];
+  const gain=1+0.03*randn();
+  const T=2*Math.PI, TG=[T,Math.PI/2+T];             // 관절2는 수직(90°)에서 출발해 360° 회전
+  let th=[0,Math.PI/2],w=[0,0],t=0,E=0,alpha=null,k=0,done=false;
+  const tr=rec?{t:[],th1:[],th2:[],I:[],V:[]}:null;
+  while(t<20){
+    let Itot=0;
+    for(let j=0;j<2;j++){
+      const wdes=clamp(P.Kp*(TG[j]-th[j]),P.wmax);
+      const grav=(j===1)?G*Math.cos(th[1]):0;
+      const drag=D[j]*w[j]*Math.abs(w[j]);
+      const tau=clamp(P.Kv*(wdes-w[j])+grav,P.tm);
+      w[j]+=((tau-grav-drag)/I[j])*dt; th[j]+=w[j]*dt;
+      Itot+=Math.abs(tau)/P.kt+P.I0;
+    }
+    const Im=Itot*gain, Vs=P.V-P.Rint*Im;
+    E+=Im*Vs*dt; t+=dt; k++;
+    if(k===10) alpha=Math.abs(w[0])/0.01;
+    if(rec&&k%10===0){
+      tr.t.push(t);tr.th1.push(th[0]);tr.th2.push(th[1]);
+      tr.I.push(Math.max(0,Im*(1+0.04*randn())+(Math.random()<0.02?0.04*Math.random():0)));
+      tr.V.push(Vs+0.015*randn());
+    }
+    if(Math.abs(TG[0]-th[0])<0.02&&Math.abs(TG[1]-th[1])<0.02&&Math.abs(w[0])<0.05&&Math.abs(w[1])<0.05){done=true;break;}
+  }
+  if(!done) return {fail:true,reason:'구동 불가: 제한 시간(20s) 내 목표 도달 실패',R,L};
+  const aTip=alpha*(R+L), area=4*Math.PI*Math.PI*R*L;
+  const eff=area*aTip/E;                             // ★임시 효율지수: 선행연구 수식으로 교체
+  return {fail:false,E,aTip,area,eff,t,R,L,tr};
+}
+
+// ===== 화면/재생 상태 =====
+let cur=null,playT=0,playing=false,last=0,dirty=true,camAz=-0.7,camEl=0.45;
+const stars=Array.from({length:120},()=>[Math.random(),Math.random(),0.3+Math.random()*0.7]);
+const bubbles=Array.from({length:30},()=>[Math.random(),Math.random(),2+Math.random()*4]);
+function fit(c){const r=c.getBoundingClientRect(),d=window.devicePixelRatio||1;
+  c.width=r.width*d;c.height=r.height*d;c.getContext('2d').setTransform(d,0,0,d,0,0);c._w=r.width;c._h=r.height;dirty=true;}
+window.addEventListener('resize',()=>{fit($('arm'));fit($('scope'));});
+document.querySelectorAll('select,input').forEach(e=>e.addEventListener('input',()=>dirty=true));
+function setCam(a,e){camAz=a;camEl=e;dirty=true;}
+const AC=$('arm');let drag=null;
+AC.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];AC.setPointerCapture(e.pointerId);});
+AC.addEventListener('pointermove',e=>{if(!drag)return;camAz+=(e.clientX-drag[0])*0.01;
+  camEl=Math.max(0.0,Math.min(1.5,camEl+(e.clientY-drag[1])*0.01));drag=[e.clientX,e.clientY];dirty=true;});
+AC.addEventListener('pointerup',()=>drag=null);
+const idx=()=>Math.min(cur.res.tr.t.length-1,Math.floor(playT/0.01));
+
+// ===== 3D 유틸 =====
+const A=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+const S=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+const SUB=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const DOT=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const CRS=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const NRM=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/l,a[1]/l,a[2]/l];};
+const LV=NRM([0.4,-0.5,0.75]);
+const COL={plate:[185,145,98],tower:[200,165,115],link1:[212,178,128],link2:[192,152,108],
+  servo:[48,48,54],cream:[233,221,191],red:[206,46,46],white:[242,242,242],brass:[192,150,60]};
+let faces=[];
+function addPoly(v,center,col){
+  let n=NRM(CRS(SUB(v[1],v[0]),SUB(v[2],v[0])));
+  const c=S(v.reduce((s,p)=>A(s,p),[0,0,0]),1/v.length);
+  if(DOT(n,SUB(c,center))<0)n=S(n,-1);
+  faces.push({v,n,c,col});
+}
+function addBox(c,e1,e2,e3,h1,h2,h3,col){
+  const q=(s1,s2,s3)=>A(c,A(S(e1,s1*h1),A(S(e2,s2*h2),S(e3,s3*h3))));
+  [[q(-1,-1,-1),q(1,-1,-1),q(1,1,-1),q(-1,1,-1)],
+   [q(-1,-1,1),q(1,-1,1),q(1,1,1),q(-1,1,1)],
+   [q(-1,-1,-1),q(1,-1,-1),q(1,-1,1),q(-1,-1,1)],
+   [q(-1,1,-1),q(1,1,-1),q(1,1,1),q(-1,1,1)],
+   [q(-1,-1,-1),q(-1,1,-1),q(-1,1,1),q(-1,-1,1)],
+   [q(1,-1,-1),q(1,1,-1),q(1,1,1),q(1,-1,1)]].forEach(f=>addPoly(f,c,col));
+}
+function addFrustum(hb,ht,z0,z1,col){
+  const b=[[-hb,-hb,z0],[hb,-hb,z0],[hb,hb,z0],[-hb,hb,z0]],t=[[-ht,-ht,z1],[ht,-ht,z1],[ht,ht,z1],[-ht,ht,z1]];
+  const c=[0,0,(z0+z1)/2];
+  addPoly(b,c,col);addPoly(t,c,col);
+  for(let i=0;i<4;i++){const j=(i+1)%4;addPoly([b[i],b[j],t[j],t[i]],c,col);}
+}
+// 로봇팔 기구학 (관절1: 수평 선회, 관절2: 상하 굴절, 링크2는 서보 축 방향으로 off만큼 비껴 있음)
+function kin(t1,t2,R,L){
+  const c1=Math.cos(t1),s1=Math.sin(t1),cp=Math.cos(t2),sp=Math.sin(t2);
+  const e1=[c1,s1,0],e2=[-s1,c1,0];
+  const u=[cp*c1,cp*s1,sp],f3=[-sp*c1,-sp*s1,cp];
+  const P0=[0,0,GEO.ZL],P1=A(P0,S(e1,R)),Pa=A(P1,S(e2,GEO.off)),T=A(Pa,S(u,L));
+  return {e1,e2,u,f3,P0,P1,Pa,T};
+}
+const hp=(k,a,b,c)=>A(k.T,A(S(k.u,a),A(S(k.e2,b),S(k.f3,c))));
+const markerPt=k=>hp(k,0.115,0.088,0.012);
+
+// ===== 로봇팔 그리기 =====
+function drawArm(){
+  const c=$('arm'),x=c.getContext('2d'),W=c._w,H=c._h;
+  const env=cur?cur.env:$('env').value;
+  if(env==='space'){x.fillStyle='#04060e';x.fillRect(0,0,W,H);x.fillStyle='#fff';
+    for(const s of stars){x.globalAlpha=s[2];x.fillRect(s[0]*W,s[1]*H,1.6,1.6);}x.globalAlpha=1;
+    x.fillStyle='#1b4f9c';x.beginPath();x.arc(W*0.12,H*1.05,H*0.35,0,7);x.fill();}
+  else if(env==='water'){const gr=x.createLinearGradient(0,0,0,H);gr.addColorStop(0,'#a9ddf4');gr.addColorStop(1,'#2a77a8');x.fillStyle=gr;x.fillRect(0,0,W,H);}
+  else{x.fillStyle='#eef2f6';x.fillRect(0,0,W,H);}
+  const tc=env==='air'?'#222':'#fff';
+  const sc=+$('zoom').value*Math.min(H/0.9,W/1.0);
+  const ca=Math.cos(camAz),sa=Math.sin(camAz),ce=Math.cos(camEl),se=Math.sin(camEl);
+  const pr=p=>{const x1=p[0]*ca-p[1]*sa,y1=p[0]*sa+p[1]*ca;return [W/2+x1*sc,H*0.52-((p[2]-0.25)*ce+y1*se)*sc];};
+  const dep=p=>(p[0]*sa+p[1]*ca)*ce-p[2]*se;
+  const rr=(cur?cur.ratio:$('ratio').value).split(':').map(Number);
+  const R=P.Lt*rr[0]/(rr[0]+rr[1]),L=P.Lt*rr[1]/(rr[0]+rr[1]);
+  const ok=cur&&!cur.res.fail;
+  let t1=0,t2=Math.PI/2;if(ok){const i=idx();t1=cur.res.tr.th1[i];t2=cur.res.tr.th2[i];}
+  const kk=kin(t1,t2,R,L);
+  const prog=Math.max(0,Math.min(1,(t1+(t2-Math.PI/2))/(4*Math.PI)));
+  const open=Math.sin(Math.PI*prog);
+  const amb=env==='space'?0.22:0.5;
+  const sh=(col,n)=>{const f=amb+(1-amb)*Math.max(0,DOT(n,LV));return `rgb(${col[0]*f|0},${col[1]*f|0},${col[2]*f|0})`;};
+  // 바닥 격자
+  const gl=(p,q)=>{const a=pr(p),b=pr(q);x.strokeStyle='rgba(128,128,128,0.3)';x.lineWidth=1;x.beginPath();x.moveTo(a[0],a[1]);x.lineTo(b[0],b[1]);x.stroke();};
+  for(let i=-4;i<=4;i++){const s=i*0.1;gl([s,-0.4,0],[s,0.4,0]);gl([-0.4,s,0],[0.4,s,0]);}
+  // 장면 구성
+  faces=[];
+  addBox([0,0,GEO.pt/2],[1,0,0],[0,1,0],[0,0,1],GEO.plate,GEO.plate,GEO.pt/2,COL.plate);
+  addFrustum(GEO.tw0,GEO.tw1,GEO.pt,GEO.pt+GEO.th,COL.tower);
+  addBox([0,0,GEO.ZL-0.03],kk.e1,kk.e2,[0,0,1],0.025,0.022,0.02,COL.servo);                     // 관절1 서보
+  addBox(A([0,0,GEO.ZL],S(kk.e1,R/2)),kk.e1,kk.e2,[0,0,1],R/2+0.03,0.025,0.02,COL.link1);      // 링크1
+  addBox(kk.P1,kk.e1,kk.e2,[0,0,1],0.017,0.021,0.022,COL.servo);                                // 관절2 서보
+  addBox(A(kk.Pa,S(kk.u,L/2-0.01)),kk.u,kk.e2,kk.f3,L/2+0.01,0.03,0.02,COL.link2);              // 링크2
+  // 장갑 손
+  addBox(hp(kk,-0.01,0,0),kk.u,kk.e2,kk.f3,0.03,0.033,0.025,COL.cream);                         // 소매
+  addBox(hp(kk,0.045,0,0),kk.u,kk.e2,kk.f3,0.045,0.04,0.006,COL.cream);                         // 손바닥
+  const spread=0.15+0.5*open;
+  [-0.03,-0.01,0.01,0.03].forEach((b0,i)=>{
+    const th=spread*(i-1.5)/1.5,len=[0.06,0.07,0.065,0.05][i];
+    const g1=A(S(kk.u,Math.cos(th)),S(kk.e2,Math.sin(th))),g2=A(S(kk.u,-Math.sin(th)),S(kk.e2,Math.cos(th)));
+    const base=hp(kk,0.09,b0,0);
+    addBox(A(base,S(g1,0.3*len)),g1,g2,kk.f3,0.3*len,0.0085,0.005,COL.cream);
+    addBox(A(base,S(g1,0.8*len)),g1,g2,kk.f3,0.2*len,0.0085,0.005,COL.red);
+  });
+  {const th=-1.0,len=0.05;
+   const g1=A(S(kk.u,Math.cos(th)),S(kk.e2,Math.sin(th))),g2=A(S(kk.u,-Math.sin(th)),S(kk.e2,Math.cos(th)));
+   const base=hp(kk,0.035,-0.04,0);
+   addBox(A(base,S(g1,0.3*len)),g1,g2,kk.f3,0.3*len,0.0095,0.006,COL.cream);
+   addBox(A(base,S(g1,0.8*len)),g1,g2,kk.f3,0.2*len,0.0095,0.006,COL.red);}
+  // 트래커 마커(스티로폼 + 빨간 끝)
+  addBox(hp(kk,0.115,0.045,0.012),kk.e2,kk.u,kk.f3,0.025,0.007,0.007,COL.white);
+  addBox(hp(kk,0.115,0.0795,0.012),kk.e2,kk.u,kk.f3,0.01,0.0075,0.0075,COL.red);
+  if(cur&&cur.load>0)addBox(hp(kk,0.135,-0.005,0.014),kk.u,kk.e2,kk.f3,0.012,0.012,0.012,COL.brass); // 추(부하)
+  // 보이는 면만, 먼 것부터
+  const vis=faces.filter(f=>{const nv=(f.n[0]*sa+f.n[1]*ca)*ce-f.n[2]*se;return nv<0;});
+  vis.forEach(f=>f.d=dep(f.c));
+  vis.sort((p,q)=>q.d-p.d);
+  for(const f of vis){
+    x.beginPath();f.v.forEach((p,i)=>{const s=pr(p);i?x.lineTo(s[0],s[1]):x.moveTo(s[0],s[1]);});x.closePath();
+    x.fillStyle=sh(f.col,f.n);x.fill();x.strokeStyle='rgba(0,0,0,0.35)';x.lineWidth=0.7;x.stroke();
+  }
+  // 끝단 궤적(마커 추적)
+  if(ok){const i=idx();x.strokeStyle='rgba(255,120,0,0.9)';x.lineWidth=1.5;x.beginPath();
+    for(let q=0;q<=i;q+=3){const k2=kin(cur.res.tr.th1[q],cur.res.tr.th2[q],R,L);const p=pr(markerPt(k2));q?x.lineTo(p[0],p[1]):x.moveTo(p[0],p[1]);}x.stroke();}
+  // 수중 효과
+  if(env==='water'){x.fillStyle='rgba(30,120,190,0.18)';x.fillRect(0,0,W,H);
+    x.fillStyle='rgba(255,255,255,0.5)';for(const b of bubbles){x.beginPath();x.arc(b[0]*W,((b[1]*H-performance.now()*0.01*b[2])%H+H)%H,b[2]*0.5,0,7);x.fill();}}
+  // 라벨
+  const lab=(p,txt)=>{const q=pr(p);x.fillStyle=tc;x.font='11px sans-serif';x.fillText(txt,q[0]+8,q[1]-8);};
+  lab([0,0,GEO.ZL+0.03],'관절1(선회)');lab(kk.Pa,'관절2(굴절)');lab(markerPt(kk),'트래커 마커');
+  x.fillStyle=tc;x.font='13px sans-serif';
+  x.fillText(`${NAME[env]} | 링크비 ${rr.join(':')} (R=${(R*100).toFixed(0)}cm, L=${(L*100).toFixed(0)}cm) | θ1=${(t1*57.3).toFixed(0)}° θ2=${(t2*57.3).toFixed(0)}° | 손 벌림 ${(open*100).toFixed(0)}%`,8,18);
+  if(env==='water')dirty=true; // 기포 애니메이션
+}
+
+// ===== 오실로스코프 (OWON XDS3104AE 스타일) =====
+const CH=[
+ {lab:'1',nm:'CH1',col:'#ffd400',vdiv:1,zero:0.8,unit:'V',f:(t,k)=>t.I[k]*P.Rs},
+ {lab:'2',nm:'CH2',col:'#2aa8ff',vdiv:2,zero:3.2,unit:'V',f:(t,k)=>t.V[k]},
+ {lab:'M',nm:'M',col:'#ff4fd8',vdiv:8,zero:3.9,unit:'VV',f:(t,k)=>t.I[k]*P.Rs*t.V[k]}
+];
+function drawScope(){
+  const c=$('scope'),x=c.getContext('2d'),W=c._w,H=c._h;
+  x.fillStyle='#000';x.fillRect(0,0,W,H);
+  const gx=30,gy=26,gw=W-44,gh=H-26-66,dw=gw/10,dh=gh/8;
+  x.strokeStyle='#333';x.lineWidth=1;
+  for(let i=0;i<=10;i++){x.beginPath();x.moveTo(gx+i*dw,gy);x.lineTo(gx+i*dw,gy+gh);x.stroke();}
+  for(let j=0;j<=8;j++){x.beginPath();x.moveTo(gx,gy+j*dh);x.lineTo(gx+gw,gy+j*dh);x.stroke();}
+  x.strokeStyle='#777';x.strokeRect(gx,gy,gw,gh);
+  for(let i=0;i<=50;i++){const X=gx+i*dw/5;x.beginPath();x.moveTo(X,gy+4*dh-3);x.lineTo(X,gy+4*dh+3);x.stroke();}
+  for(let j=0;j<=40;j++){const Y=gy+j*dh/5;x.beginPath();x.moveTo(gx+5*dw-3,Y);x.lineTo(gx+5*dw+3,Y);x.stroke();}
+  x.font='11px monospace';x.fillStyle='#bbb';x.fillText('OWON  XDS3104AE   100MHz',gx,14);
+  const td=+$('tdiv').value,span=10*td;
+  const stats=[];
+  if(cur&&!cur.res.fail){
+    const tr=cur.res.tr,i=idx(),t0=Math.max(0,playT-span);
+    x.save();x.beginPath();x.rect(gx,gy,gw,gh);x.clip();
+    for(const ch of CH){x.strokeStyle=ch.col;x.lineWidth=1.6;x.beginPath();let first=true,mx=-1e9,mn=1e9,sm=0,n=0;
+      for(let k=0;k<=i;k++){const t=tr.t[k];if(t<t0)continue;const v=ch.f(tr,k);
+        mx=Math.max(mx,v);mn=Math.min(mn,v);sm+=v;n++;
+        const X=gx+(t-t0)/span*gw,Y=gy+gh-(ch.zero+v/ch.vdiv)*dh;
+        if(first){x.moveTo(X,Y);first=false;}else x.lineTo(X,Y);}
+      x.stroke();stats.push({mx,mn,mean:n?sm/n:0});}
+    x.restore();
+    let E=0;for(let k=0;k<=i;k++)E+=CH[2].f(tr,k)*0.01;E/=P.Rs;
+    x.fillStyle='#fff';x.font='12px monospace';
+    x.fillText(`분홍 넓이 ÷ Rs(${P.Rs}) = ${E.toFixed(2)} J   t=${Math.min(playT,tr.t[tr.t.length-1]).toFixed(2)} s`,gx+190,14);
+    const f=v=>v.toFixed(3);
+    x.font='12px monospace';
+    x.fillStyle=CH[0].col;x.fillText(`CH1 Vmax ${f(stats[0].mx)}V  Vpp ${f(stats[0].mx-stats[0].mn)}V  Vmean ${f(stats[0].mean)}V`,gx,gy+gh+16);
+    x.fillStyle=CH[1].col;x.fillText(`CH2 Vmax ${f(stats[1].mx)}V  Vpp ${f(stats[1].mx-stats[1].mn)}V  Vmean ${f(stats[1].mean)}V`,gx,gy+gh+32);
+    x.fillStyle=CH[2].col;x.fillText(`M   Vmax ${f(stats[2].mx)}VV Vmean ${f(stats[2].mean)}VV`,gx,gy+gh+48);
+  }else if(cur&&cur.res.fail){
+    x.fillStyle='#ff5555';x.font='15px sans-serif';x.fillText(cur.res.reason+' → 측정 불가',gx+10,gy+gh/2);
+  }
+  x.font='bold 13px monospace';
+  x.fillStyle=playing?'#3f3':'#f44';x.fillText(playing?'RUN':'STOP',gx+gw-48,14);
+  CH.forEach((ch,n)=>{
+    const Y=gy+gh-ch.zero*dh;x.fillStyle=ch.col;x.beginPath();x.moveTo(gx-12,Y-5);x.lineTo(gx-2,Y);x.lineTo(gx-12,Y+5);x.fill();
+    x.font='10px monospace';x.fillText(ch.lab,gx-26,Y+4);
+    x.font='12px monospace';x.fillText(`${ch.nm} ${ch.vdiv.toFixed(2)}${ch.unit}`,gx+gw*0.55+n*(gw*0.15),H-8);});
+  x.fillStyle='#ddd';x.fillText(`M ${td.toFixed(2)}s`,gx+gw*0.55-80,H-8);
+}
+
+// ===== 재생 루프 =====
+function frame(ts){
+  if(!last)last=ts;const d=Math.min(0.1,(ts-last)/1000);last=ts;
+  if(playing&&cur&&!cur.res.fail){
+    playT+=d*(+$('speed').value);
+    const tEnd=cur.res.tr.t[cur.res.tr.t.length-1];
+    if(playT>=tEnd){playT=tEnd;playing=false;}
+    dirty=true;
+  }
+  if(dirty){dirty=false;drawArm();drawScope();}
+  requestAnimationFrame(frame);
+}
+function toggleRun(){
+  if(!cur||cur.res.fail)return;
+  if(playing)playing=false;
+  else{if(playT>=cur.res.tr.t[cur.res.tr.t.length-1])playT=0;playing=true;}
+  dirty=true;
+}
+
+// ===== 버튼 동작 =====
+const head='<tr><th>환경</th><th>링크비</th><th>부하(g)</th><th>회차</th><th>에너지(J)</th><th>가속도(m/s²)</th><th>면적(m²)</th><th>효율지수</th><th>시간(s)</th></tr>';
+function rowHtml(e,r,l,k,res){
+  if(res.fail)return `<tr><td>${NAME[e]}</td><td>${r}</td><td>${l}</td><td>${k}</td><td colspan="5">측정 불가 (${res.reason})</td></tr>`;
+  return `<tr><td>${NAME[e]}</td><td>${r}</td><td>${l}</td><td>${k}</td><td>${res.E.toFixed(3)}</td><td>${res.aTip.toFixed(3)}</td><td>${res.area.toFixed(3)}</td><td>${res.eff.toFixed(3)}</td><td>${res.t.toFixed(2)}</td></tr>`;
+}
+function runOne(){
+  applyParams();
+  const e=$('env').value,r=$('ratio').value,l=+$('load').value,n=+$('neutral').value,h=+$('hand').value;
+  const res=sim(e,r,l,n,h,true);
+  cur={res,env:e,ratio:r,load:l};
+  playT=0;
+  if(res.fail){playing=false;$('msg').textContent=res.reason;}
+  else{
+    $('tdiv').value='5';
+    for(const v of ['0.5','1','2','5']){if(10*+v>=res.t){$('tdiv').value=v;break;}}
+    playing=true;$('msg').textContent=`${NAME[e]} / ${r} / ${l}g : E=${res.E.toFixed(2)} J, 끝단 가속도=${res.aTip.toFixed(1)} m/s², 효율지수=${res.eff.toFixed(2)}`;
+  }
+  $('out').innerHTML=head+rowHtml(e,r,l,1,res);dirty=true;
+}
+function runAll(){
+  applyParams();
+  const n=+$('neutral').value,h=+$('hand').value;
+  let html=head,csv='환경,링크비,부하,회차,에너지,가속도,면적,효율지수\n';
+  for(const e of ['air','water','space'])for(const r of ['1:1','2:1','1:2'])for(const l of [0,25])for(let k=1;k<=3;k++){
+    const res=sim(e,r,l,n,h,false);html+=rowHtml(e,r,l,k,res);
+    csv+=res.fail?`${e},${r},${l},${k},NA,NA,NA,NA\n`:[e,r,l,k,res.E.toFixed(4),res.aTip.toFixed(4),res.area.toFixed(4),res.eff.toFixed(4)].join(',')+'\n';
+  }
+  $('out').innerHTML=html;$('csv').value=csv;
+}
+fit($('arm'));fit($('scope'));requestAnimationFrame(frame);
+</script>
+<footer style="margin-top:20px;font-size:12px;color:#666">
+ 선행연구: 「아두이노 기반 관절 로봇팔의 관절 링크비와 부하 무게가 효율지수에 미치는 영향 분석: 이원배치분산분석을 중심으로」<br>
+ ※ 모든 파라미터와 효율지수 식은 임시값이며 실측 후 보정 전의 시뮬레이션 결과입니다.
+</footer>
+</body></html>
